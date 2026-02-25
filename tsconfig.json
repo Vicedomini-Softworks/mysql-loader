@@ -6,7 +6,8 @@
     "types": ["bun-types", "node"],
     "strict": true,
     "jsx": "react-jsx",
-    "noEmit": true
+    "noEmit": true,
+    "skipLibCheck": true
   },
   "include": ["*.ts", "*.tsx"]
 }
