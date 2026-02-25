@@ -1,9 +1,15 @@
-import { Hono } from "hono@4";
+import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { basicAuth } from "hono/basic-auth";
 import { mkdir, readdir } from "fs/promises";
 import { existsSync, createWriteStream } from "fs";
 import path from "path";
+
+console.log("MYSQL Loader is running...");
+console.log("UPLOAD_DIR:", process.env.UPLOAD_DIR);
+console.log("WORK_DIR:", process.env.WORK_DIR);
+console.log("MYSQL_HOST:", process.env.MYSQL_HOST);
+console.log("MYSQL_DATABASE:", process.env.MYSQL_DATABASE);
 
 const app = new Hono({ strict: false });
 
