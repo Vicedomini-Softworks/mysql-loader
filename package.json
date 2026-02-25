@@ -1,1 +1,29 @@
-{"name": "mysql-loader","version": "1.0.0","description": "MySQL loader","main": "index.js","scripts": {"test": "echo \"Error: no test specified\" && exit 1},"author": "Vicedomini Softworks","license": "Unlicense"}
+{
+  "name": "@vicedomini-softworks/mysql-loader",
+  "version": "0.1.0",
+  "description": "A TypeScript application for loading data into MySQL databases",
+  "type": "module",
+  "main": "index.tsx",
+  "scripts": {
+    "dev": "bun run --hot index.tsx",
+    "build": "bun build ./index.tsx --outdir ./dist",
+    "start": "bun index.tsx",
+    "load": "bash load.sh"
+  },
+  "keywords": [
+    "mysql",
+    "loader",
+    "database",
+    "typescript"
+  ],
+  "author": "Vicedomini-Softworks",
+  "license": "Unlicense",
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  }
+}
