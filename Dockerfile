@@ -1,24 +1,24 @@
 FROM ghcr.io/railwayapp/function-bun:1.3.0
 
-# Switch to root to install packages
+# Passa a root per installare pacchetti
 USER root
 
-# Install mysql client only (Debian-based image)
+# Installa client MySQL
 RUN apt-get update && \
     apt-get install -y default-mysql-client && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Go back to bun user (important for Railway security model)
-USER bun
-
 WORKDIR /app
 
-# Copy project files
+# Copia progetto
 COPY . .
 
-# Install dependencies (if needed)
+# Installa dipendenze come root
 RUN bun install
+
+# Torna a bun per runtime (opzionale)
+USER bun
 
 EXPOSE 3000
 
