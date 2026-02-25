@@ -1,0 +1,1 @@
+{"name": "mysql-loader","version": "1.0.0","description": "MySQL loader","main": "index.js","scripts": {"test": "echo \"Error: no test specified\" && exit 1},"author": "Vicedomini Softworks","license": "Unlicense"}
