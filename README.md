@@ -52,6 +52,7 @@ Upload endpoint is protected with **HTTP Basic Auth**.
 | `MYSQL_USER` | MySQL user | *required* |
 | `MYSQL_PASSWORD` | MySQL password | *required* |
 | `MYSQL_DATABASE` | Target database | *required* |
+| `MYSQL_SSL_SELF_SIGNED` | Use SSL and accept self-signed server cert (`1` or `true`) | — |
 
 ## Docker
 
