@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { basicAuth } from "hono/basic-auth";
+import { createConnection } from "mysql2/promise";
 import { mkdir, readdir } from "fs/promises";
 import { existsSync, createWriteStream } from "fs";
 import path from "path";
@@ -138,34 +139,24 @@ async function runSqlMigration(filePath: string) {
     console.log("Running SQL:", sqlPath, `(${formatBytes(totalBytes)})`);
     console.log("");
 
-    const mysqlCmd = [
-      "mysql",
-      "-h",
-      process.env.MYSQL_HOST!,
-      "-P",
-      process.env.MYSQL_PORT || "3306",
-      "-u",
-      process.env.MYSQL_USER!,
-      `-p${process.env.MYSQL_PASSWORD}`,
-      process.env.MYSQL_DATABASE!,
-    ];
-
-    // Accept self-signed certificate: use SSL but do not verify server cert
-    if (process.env.MYSQL_SSL_SELF_SIGNED === "1" || process.env.MYSQL_SSL_SELF_SIGNED === "true") {
-      mysqlCmd.splice(-1, 0, "--ssl-mode=REQUIRED");
-    }
-
-    const mysqlProcess = Bun.spawn({
-      cmd: mysqlCmd,
-      stdin: "pipe",
-      stdout: "inherit",
-      stderr: "inherit",
+    const connection = await createConnection({
+      host: process.env.MYSQL_HOST,
+      port: Number(process.env.MYSQL_PORT || "3306"),
+      user: process.env.MYSQL_USER,
+      password: process.env.MYSQL_PASSWORD,
+      database: process.env.MYSQL_DATABASE,
+      multipleStatements: true,
+      ...(process.env.MYSQL_SSL_SELF_SIGNED === "1" ||
+      process.env.MYSQL_SSL_SELF_SIGNED === "true"
+        ? { ssl: { rejectUnauthorized: false } }
+        : {}),
     });
 
-    const stdin = mysqlProcess.stdin!;
     const startTime = Date.now();
     let bytesRead = 0;
     let lastLogTime = 0;
+    const decoder = new TextDecoder("utf-8", { fatal: false });
+    let buffer = "";
 
     const stream = sqlFile.stream();
     const reader = stream.getReader();
@@ -175,28 +166,38 @@ async function runSqlMigration(filePath: string) {
         const { done, value } = await reader.read();
         if (done) break;
         const chunk = value as Uint8Array;
-        stdin.write(chunk);
         bytesRead += chunk.length;
+        buffer += decoder.decode(chunk);
 
         const now = Date.now();
         if (now - lastLogTime >= PROGRESS_UPDATE_INTERVAL_MS || bytesRead === totalBytes) {
           lastLogTime = now;
           process.stdout.write("\r" + renderProgressBar(bytesRead, totalBytes, startTime));
         }
+
+        // Split on statement boundary (;\n or ;\r\n), execute complete statements
+        const parts = buffer.split(/\s*;\s*\r?\n/);
+        buffer = parts.pop() ?? "";
+        for (const part of parts) {
+          const stmt = part.trim();
+          if (stmt.length > 0 && !stmt.startsWith("--")) {
+            await connection.query(stmt + ";");
+          }
+        }
       }
-      stdin.end();
+
+      // Execute remaining buffer
+      const remainder = buffer.trim();
+      if (remainder.length > 0 && !remainder.startsWith("--")) {
+        const stmt = remainder.endsWith(";") ? remainder : remainder + ";";
+        await connection.query(stmt);
+      }
     } finally {
       reader.releaseLock();
+      await connection.end();
     }
 
-    const exitCode = await mysqlProcess.exited;
-
-    // Final progress line and newline
     process.stdout.write("\r" + renderProgressBar(totalBytes, totalBytes, startTime) + "\n");
-
-    if (exitCode !== 0) {
-      throw new Error("MySQL import failed");
-    }
 
     const elapsed = (Date.now() - startTime) / 1000;
     console.log(

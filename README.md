@@ -6,7 +6,7 @@ A small **edge-style** HTTP service that loads a gzipped (or zipped) SQL backup 
 
 1. **Accepts** an uploaded backup (gzip, tgz, zip, or raw `.sql`)
 2. **Unzips** it into a temporary work directory
-3. **Loads** the single `.sql` file into MySQL via the `mysql` CLI
+3. **Loads** the single `.sql` file into MySQL via the `mysql2` library (streamed read; memory is bounded by the largest single statement)
 4. **Done.** The service can then be deleted or scaled to zero.
 
 The archive must contain **exactly one** `.sql` file.
@@ -16,7 +16,7 @@ The archive must contain **exactly one** `.sql` file.
 ### Prerequisites
 
 - [Bun](https://bun.sh) ≥ 1.0
-- MySQL client CLI (`mysql`) and `unzip` / `tar` (for decompression)
+- `unzip` and `tar` for decompressing uploads (no MySQL CLI required; the app uses the `mysql2` library)
 
 ### Run locally
 

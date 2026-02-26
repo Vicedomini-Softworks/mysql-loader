@@ -19,7 +19,8 @@
   "author": "Vicedomini-Softworks",
   "license": "Unlicense",
   "dependencies": {
-    "hono": "^4.0.0"
+    "hono": "^4.0.0",
+    "mysql2": "^3.18.1"
   },
   "devDependencies": {
     "@types/bun": "latest",

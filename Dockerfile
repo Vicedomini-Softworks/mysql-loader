@@ -1,9 +1,9 @@
 # Official Bun runtime (includes Bun; no separate install needed)
 FROM oven/bun:1-debian
 
-# Install MySQL client for load scripts
+# unzip for .zip and .gz uploads (mysql2 for DB, no CLI)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends default-mysql-client && \
+    apt-get install -y --no-install-recommends unzip && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
