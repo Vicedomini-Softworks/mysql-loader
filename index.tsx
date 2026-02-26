@@ -5,16 +5,19 @@ import { mkdir, readdir } from "fs/promises";
 import { existsSync, createWriteStream } from "fs";
 import path from "path";
 
-console.log("MYSQL Loader is running...");
-console.log("UPLOAD_DIR:", process.env.UPLOAD_DIR);
-console.log("WORK_DIR:", process.env.WORK_DIR);
-console.log("MYSQL_HOST:", process.env.MYSQL_HOST);
-console.log("MYSQL_DATABASE:", process.env.MYSQL_DATABASE);
-
 const app = new Hono({ strict: false });
 
 const UPLOAD_DIR = process.env.UPLOAD_DIR || "./uploads";
 const WORK_DIR = process.env.WORK_DIR || "./work";
+const PORT = process.env.PORT || 3000;
+const MAX_BODY_SIZE = process.env.MAX_BODY_SIZE || 10 * 1024 * 1024 * 1024;
+
+console.log("MYSQL Loader is running on port", PORT);
+console.log("UPLOAD_DIR:", UPLOAD_DIR);
+console.log("WORK_DIR:", WORK_DIR);
+console.log("MAX_BODY_SIZE:", MAX_BODY_SIZE);
+console.log("MYSQL_HOST:", process.env.MYSQL_HOST);
+console.log("MYSQL_DATABASE:", process.env.MYSQL_DATABASE);
 
 for (const dir of [UPLOAD_DIR, WORK_DIR]) {
   if (!existsSync(dir)) {
@@ -116,8 +119,7 @@ async function runSqlMigration(filePath: string) {
 }
 
 Bun.serve({
-  port: Number(process.env.PORT) || 3000,
+  port: Number(PORT),
   fetch: app.fetch,
-  maxRequestBodySize:
-    Number(process.env.MAX_BODY_SIZE) || 10 * 1024 * 1024 * 1024,
+  maxRequestBodySize: Number(MAX_BODY_SIZE),
 });
