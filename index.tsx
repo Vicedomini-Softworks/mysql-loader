@@ -227,11 +227,12 @@ const UI_HTML = /* html */ `<!DOCTYPE html>
       let   uploadedBytes = alreadyDone;
       const startTime   = Date.now();
 
-      function updateProgress() {
-        const done  = Math.min(uploadedBytes, file.size);
+      // inChunk: bytes of the current chunk already sent (from XHR progress)
+      function updateProgress(inChunk) {
+        const done  = Math.min(uploadedBytes + inChunk, file.size);
         const pct   = file.size > 0 ? done / file.size : 1;
         const elapsed = (Date.now() - startTime) / 1000;
-        const newBytes = uploadedBytes - alreadyDone;
+        const newBytes = done - alreadyDone;
         const speed = elapsed > 0 && newBytes > 0 ? newBytes / elapsed : 0;
         const eta   = speed > 0 ? (file.size - done) / speed : Infinity;
         progFill.style.width = (pct * 100).toFixed(1) + '%';
@@ -241,7 +242,39 @@ const UI_HTML = /* html */ `<!DOCTYPE html>
         sEta.textContent   = 'ETA ' + fmtDur(eta);
       }
 
-      updateProgress();
+      updateProgress(0);
+
+      // XHR-based chunk sender: streams the Blob directly from disk and
+      // fires upload progress events (fetch does neither for large payloads).
+      function sendChunk(chunkBlob, chunkIdx, onProgress) {
+        return new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open('POST', '/api/upload/chunk');
+          xhr.withCredentials = true;
+          xhr.setRequestHeader('X-Upload-Id',    uploadId);
+          xhr.setRequestHeader('X-Chunk-Index',  String(chunkIdx));
+          xhr.setRequestHeader('X-Total-Chunks', String(totalChunks));
+
+          xhr.upload.addEventListener('progress', (e) => {
+            if (e.lengthComputable) onProgress(e.loaded);
+          });
+
+          xhr.addEventListener('load', () => {
+            if (xhr.status === 200) {
+              let data; try { data = JSON.parse(xhr.responseText); } catch { data = {}; }
+              resolve(data);
+            } else {
+              let msg = 'HTTP ' + xhr.status;
+              try { msg = JSON.parse(xhr.responseText).error || msg; } catch {}
+              reject(Object.assign(new Error(msg), { status: xhr.status }));
+            }
+          });
+          xhr.addEventListener('error', () => reject(new Error('Network error')));
+          xhr.addEventListener('abort', () => reject(new Error('Aborted')));
+
+          xhr.send(chunkBlob);
+        });
+      }
 
       for (let i = 0; i < totalChunks; i++) {
         if (confirmed.has(i)) continue;
@@ -259,33 +292,20 @@ const UI_HTML = /* html */ `<!DOCTYPE html>
             statusEl.textContent = 'Retrying chunk ' + (i + 1) + '\u202f/\u202f' + totalChunks + '\u2026';
           }
           try {
-            const res = await fetch('/api/upload/chunk', {
-              method: 'POST',
-              headers: {
-                'X-Upload-Id':    uploadId,
-                'X-Chunk-Index':  String(i),
-                'X-Total-Chunks': String(totalChunks),
-              },
-              body: chunk,
-              credentials: 'include',
-            });
-            if (!res.ok) {
-              if (res.status === 401) {
-                statusEl.textContent = 'Authentication failed. Reload the page to re-enter credentials.';
-                statusEl.className = 'err';
-                uploadBtn.textContent = 'Resume Upload';
-                uploadBtn.disabled = false;
-                resumeState = { uploadId, totalChunks, confirmedChunks: confirmed };
-                return;
-              }
-              let msg = 'HTTP ' + res.status;
-              try { msg = (await res.json()).error || msg; } catch {}
-              throw new Error(msg);
+            const data = await sendChunk(chunk, i, (loaded) => updateProgress(loaded));
+
+            if (data.status === 401) {
+              statusEl.textContent = 'Authentication failed. Reload the page to re-enter credentials.';
+              statusEl.className = 'err';
+              resumeState = { uploadId, totalChunks, confirmedChunks: confirmed };
+              uploadBtn.textContent = 'Resume Upload';
+              uploadBtn.disabled = false;
+              return;
             }
-            const data = await res.json();
+
             confirmed.add(i);
             uploadedBytes += chunk.size;
-            updateProgress();
+            updateProgress(0);
 
             if (data.complete) {
               localStorage.removeItem(storageKey(file));
