@@ -79,8 +79,9 @@ const UI_HTML = /* html */ `<!DOCTYPE html>
     #drop-zone p { color: #8b949e; line-height: 1.7; }
     #drop-zone label { color: #58a6ff; cursor: pointer; text-decoration: underline; }
     #file-input { display: none; }
-    #file-name { margin-top: .75rem; font-weight: 600; color: #e6edf3; word-break: break-all; }
-    #file-size { margin-top: .2rem; font-size: .85rem; color: #8b949e; }
+    #file-name  { margin-top: .75rem; font-weight: 600; color: #e6edf3; word-break: break-all; }
+    #file-size  { margin-top: .2rem; font-size: .85rem; color: #8b949e; }
+    #resume-note { margin-top: .5rem; font-size: .82rem; color: #d29922; }
     #upload-btn {
       margin-top: 1.5rem; padding: .65rem 0;
       background: #238636; color: #fff; border: none; border-radius: 6px;
@@ -111,6 +112,7 @@ const UI_HTML = /* html */ `<!DOCTYPE html>
     <input type="file" id="file-input" accept=".gz,.tgz,.zip,.sql">
     <div id="file-name"></div>
     <div id="file-size"></div>
+    <div id="resume-note"></div>
   </div>
 
   <button id="upload-btn" disabled>Upload</button>
@@ -128,20 +130,24 @@ const UI_HTML = /* html */ `<!DOCTYPE html>
   <div id="status"></div>
 
   <script>
-    const dropZone   = document.getElementById('drop-zone');
-    const fileInput  = document.getElementById('file-input');
-    const uploadBtn  = document.getElementById('upload-btn');
-    const progWrap   = document.getElementById('progress-wrap');
-    const progFill   = document.getElementById('progress-fill');
-    const sPct       = document.getElementById('s-pct');
-    const sBytes     = document.getElementById('s-bytes');
-    const sSpeed     = document.getElementById('s-speed');
-    const sEta       = document.getElementById('s-eta');
-    const statusEl   = document.getElementById('status');
-    const fileNameEl = document.getElementById('file-name');
-    const fileSizeEl = document.getElementById('file-size');
+    const CHUNK_SIZE = 10 * 1024 * 1024; // 10 MB
+
+    const dropZone    = document.getElementById('drop-zone');
+    const fileInput   = document.getElementById('file-input');
+    const uploadBtn   = document.getElementById('upload-btn');
+    const progWrap    = document.getElementById('progress-wrap');
+    const progFill    = document.getElementById('progress-fill');
+    const sPct        = document.getElementById('s-pct');
+    const sBytes      = document.getElementById('s-bytes');
+    const sSpeed      = document.getElementById('s-speed');
+    const sEta        = document.getElementById('s-eta');
+    const statusEl    = document.getElementById('status');
+    const fileNameEl  = document.getElementById('file-name');
+    const fileSizeEl  = document.getElementById('file-size');
+    const resumeNote  = document.getElementById('resume-note');
 
     let selectedFile = null;
+    let resumeState  = null; // { uploadId, totalChunks, confirmedChunks: Set }
 
     function fmt(b) {
       if (b >= 1e9) return (b / 1e9).toFixed(2) + ' GB';
@@ -150,89 +156,165 @@ const UI_HTML = /* html */ `<!DOCTYPE html>
       return b + ' B';
     }
     function fmtDur(s) {
-      if (!isFinite(s) || s <= 0) return '—';
+      if (!isFinite(s) || s <= 0) return '\u2014';
       if (s < 60) return Math.round(s) + 's';
       return Math.floor(s / 60) + 'm ' + Math.round(s % 60) + 's';
     }
+    function storageKey(f) { return 'mysql-loader::' + f.name + '::' + f.size; }
 
-    function pickFile(file) {
+    async function checkResume(file) {
+      const raw = localStorage.getItem(storageKey(file));
+      if (!raw) return null;
+      let saved; try { saved = JSON.parse(raw); } catch { return null; }
+      const { uploadId, totalChunks } = saved;
+      if (!uploadId || !totalChunks) return null;
+      try {
+        const r = await fetch('/api/upload/resume/' + uploadId, { credentials: 'include' });
+        if (!r.ok) return null;
+        const { chunks } = await r.json();
+        if (!chunks.length) return null;
+        return { uploadId, totalChunks, confirmedChunks: new Set(chunks) };
+      } catch { return null; }
+    }
+
+    async function pickFile(file) {
       selectedFile = file;
       fileNameEl.textContent = file.name;
       fileSizeEl.textContent = fmt(file.size);
       dropZone.classList.add('has-file');
       dropZone.classList.remove('drag-over');
-      uploadBtn.disabled = false;
       statusEl.textContent = '';
       statusEl.className = '';
+      resumeNote.textContent = '';
+      uploadBtn.textContent = 'Upload';
+      uploadBtn.disabled = false;
+
+      resumeState = await checkResume(file);
+      if (resumeState) {
+        const done  = resumeState.confirmedChunks.size;
+        const total = resumeState.totalChunks;
+        resumeNote.textContent = '\u21ba Resume available: ' + done + '\u202f/\u202f' + total + ' chunks already on server.';
+        uploadBtn.textContent = 'Resume Upload';
+      }
     }
 
-    dropZone.addEventListener('click', (e) => {
-      if (!e.target.closest('label')) fileInput.click();
-    });
+    dropZone.addEventListener('click', (e) => { if (!e.target.closest('label')) fileInput.click(); });
     fileInput.addEventListener('change', () => { if (fileInput.files[0]) pickFile(fileInput.files[0]); });
     dropZone.addEventListener('dragover',  (e) => { e.preventDefault(); dropZone.classList.add('drag-over'); });
     dropZone.addEventListener('dragleave', ()  => dropZone.classList.remove('drag-over'));
     dropZone.addEventListener('drop', (e) => {
       e.preventDefault();
-      const file = e.dataTransfer.files[0];
-      if (file) pickFile(file);
+      const f = e.dataTransfer.files[0];
+      if (f) pickFile(f);
     });
 
-    uploadBtn.addEventListener('click', () => {
+    uploadBtn.addEventListener('click', startUpload);
+
+    async function startUpload() {
       if (!selectedFile) return;
       uploadBtn.disabled = true;
       progWrap.style.display = 'block';
-      statusEl.textContent = 'Uploading\u2026';
       statusEl.className = '';
 
-      const startTime = Date.now();
+      const file        = selectedFile;
+      const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+      const uploadId    = resumeState ? resumeState.uploadId : crypto.randomUUID();
 
-      const xhr = new XMLHttpRequest();
-      xhr.open('POST', '/api/upload');
-      xhr.withCredentials = true;
+      localStorage.setItem(storageKey(file), JSON.stringify({ uploadId, totalChunks }));
 
-      xhr.upload.addEventListener('progress', (e) => {
-        if (!e.lengthComputable) return;
-        const pct     = e.loaded / e.total;
+      const confirmed   = resumeState ? new Set(resumeState.confirmedChunks) : new Set();
+      const alreadyDone = confirmed.size * CHUNK_SIZE;
+      let   uploadedBytes = alreadyDone;
+      const startTime   = Date.now();
+
+      function updateProgress() {
+        const done  = Math.min(uploadedBytes, file.size);
+        const pct   = file.size > 0 ? done / file.size : 1;
         const elapsed = (Date.now() - startTime) / 1000;
-        const speed   = elapsed > 0 ? e.loaded / elapsed : 0;
-        const eta     = speed > 0 ? (e.total - e.loaded) / speed : Infinity;
+        const newBytes = uploadedBytes - alreadyDone;
+        const speed = elapsed > 0 && newBytes > 0 ? newBytes / elapsed : 0;
+        const eta   = speed > 0 ? (file.size - done) / speed : Infinity;
         progFill.style.width = (pct * 100).toFixed(1) + '%';
         sPct.textContent   = (pct * 100).toFixed(1) + '%';
-        sBytes.textContent = fmt(e.loaded) + ' / ' + fmt(e.total);
-        sSpeed.textContent = fmt(speed) + '/s';
+        sBytes.textContent = fmt(done) + ' / ' + fmt(file.size);
+        sSpeed.textContent = speed > 0 ? fmt(speed) + '/s' : '\u2014 /s';
         sEta.textContent   = 'ETA ' + fmtDur(eta);
-      });
+      }
 
-      xhr.addEventListener('load', () => {
-        progFill.style.width = '100%';
-        sPct.textContent = '100%';
-        sEta.textContent = 'done';
-        if (xhr.status === 200) {
-          statusEl.textContent = 'Upload complete \u2014 migration is running on the server. Check server logs for progress.';
-          statusEl.className = 'ok';
-        } else if (xhr.status === 401) {
-          statusEl.textContent = 'Authentication failed. Reload the page to re-enter credentials.';
-          statusEl.className = 'err';
-          uploadBtn.disabled = false;
-        } else {
-          let msg = 'Upload failed (HTTP ' + xhr.status + ').';
-          try { msg = JSON.parse(xhr.responseText).error || msg; } catch {}
-          statusEl.textContent = msg;
-          statusEl.className = 'err';
-          uploadBtn.disabled = false;
+      updateProgress();
+
+      for (let i = 0; i < totalChunks; i++) {
+        if (confirmed.has(i)) continue;
+
+        const chunk = file.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+        statusEl.textContent = 'Uploading chunk ' + (i + 1) + '\u202f/\u202f' + totalChunks + '\u2026';
+
+        let lastErr = null;
+        for (let attempt = 0; attempt < 4; attempt++) {
+          if (attempt > 0) {
+            const wait = Math.min(1000 * Math.pow(2, attempt - 1), 8000);
+            statusEl.textContent = 'Network error \u2014 retrying chunk ' + (i + 1) + '/' + totalChunks +
+              ' (attempt ' + (attempt + 1) + '/4) in ' + (wait / 1000) + 's\u2026';
+            await new Promise(r => setTimeout(r, wait));
+            statusEl.textContent = 'Retrying chunk ' + (i + 1) + '\u202f/\u202f' + totalChunks + '\u2026';
+          }
+          try {
+            const res = await fetch('/api/upload/chunk', {
+              method: 'POST',
+              headers: {
+                'X-Upload-Id':    uploadId,
+                'X-Chunk-Index':  String(i),
+                'X-Total-Chunks': String(totalChunks),
+              },
+              body: chunk,
+              credentials: 'include',
+            });
+            if (!res.ok) {
+              if (res.status === 401) {
+                statusEl.textContent = 'Authentication failed. Reload the page to re-enter credentials.';
+                statusEl.className = 'err';
+                uploadBtn.textContent = 'Resume Upload';
+                uploadBtn.disabled = false;
+                resumeState = { uploadId, totalChunks, confirmedChunks: confirmed };
+                return;
+              }
+              let msg = 'HTTP ' + res.status;
+              try { msg = (await res.json()).error || msg; } catch {}
+              throw new Error(msg);
+            }
+            const data = await res.json();
+            confirmed.add(i);
+            uploadedBytes += chunk.size;
+            updateProgress();
+
+            if (data.complete) {
+              localStorage.removeItem(storageKey(file));
+              progFill.style.width = '100%';
+              sPct.textContent = '100%';
+              sEta.textContent = 'done';
+              statusEl.textContent = 'Upload complete \u2014 migration is running on the server. Check server logs for progress.';
+              statusEl.className = 'ok';
+              return;
+            }
+            lastErr = null;
+            break;
+          } catch (err) {
+            lastErr = err;
+          }
         }
-      });
 
-      xhr.addEventListener('error', () => {
-        statusEl.textContent = 'Network error during upload.';
-        statusEl.className = 'err';
-        uploadBtn.disabled = false;
-      });
-
-      // Send the File object directly — browser streams it from disk, no full RAM load
-      xhr.send(selectedFile);
-    });
+        if (lastErr) {
+          statusEl.textContent = 'Failed after 4 attempts on chunk ' + (i + 1) + '/' + totalChunks +
+            ': ' + lastErr.message + '. Click \u201cResume Upload\u201d to retry.';
+          statusEl.className = 'err';
+          resumeNote.textContent = '\u21ba ' + confirmed.size + '\u202f/\u202f' + totalChunks + ' chunks saved \u2014 you can resume.';
+          resumeState = { uploadId, totalChunks, confirmedChunks: confirmed };
+          uploadBtn.textContent = 'Resume Upload';
+          uploadBtn.disabled = false;
+          return;
+        }
+      }
+    }
   </script>
 </body>
 </html>`;
@@ -267,6 +349,7 @@ const auth = basicAuth({
 
 app.use("/", auth);
 app.use("/api/upload", auth);
+app.use("/api/upload/*", auth);
 
 app.get("/api/health", (c) => c.json({ status: "ok" }));
 
@@ -293,6 +376,76 @@ app.post("/api/upload", async (c) => {
 
   return c.json({ message: "Upload complete. SQL migration started." });
 });
+
+app.get("/api/upload/resume/:uploadId", async (c) => {
+  const uploadId = c.req.param("uploadId");
+  if (!/^[\w-]+$/.test(uploadId)) return c.json({ error: "Invalid upload ID" }, 400);
+  const uploadDir = path.join(UPLOAD_DIR, uploadId);
+  if (!existsSync(uploadDir)) return c.json({ chunks: [] });
+  const files = await readdir(uploadDir);
+  const chunks = files
+    .filter((f) => /^chunk-\d+$/.test(f))
+    .map((f) => parseInt(f.slice(6), 10))
+    .sort((a, b) => a - b);
+  return c.json({ chunks });
+});
+
+app.post("/api/upload/chunk", async (c) => {
+  const uploadId    = c.req.header("X-Upload-Id") ?? "";
+  const chunkIndex  = parseInt(c.req.header("X-Chunk-Index") ?? "", 10);
+  const totalChunks = parseInt(c.req.header("X-Total-Chunks") ?? "", 10);
+
+  if (
+    !/^[\w-]+$/.test(uploadId) ||
+    isNaN(chunkIndex) || isNaN(totalChunks) ||
+    chunkIndex < 0 || chunkIndex >= totalChunks
+  ) {
+    return c.json({ error: "Invalid chunk metadata" }, 400);
+  }
+
+  const uploadDir = path.join(UPLOAD_DIR, uploadId);
+  if (!existsSync(uploadDir)) await mkdir(uploadDir, { recursive: true });
+
+  const chunkPath = path.join(uploadDir, `chunk-${chunkIndex}`);
+  const reader = c.req.raw.body?.getReader();
+  if (!reader) return c.json({ error: "No body stream" }, 400);
+
+  const ws = createWriteStream(chunkPath);
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    ws.write(value);
+  }
+  await new Promise<void>((resolve) => ws.end(resolve));
+
+  const files    = await readdir(uploadDir);
+  const received = files.filter((f) => /^chunk-\d+$/.test(f)).length;
+
+  if (received === totalChunks) {
+    reassembleAndMigrate(uploadId, totalChunks);
+    return c.json({ complete: true, message: "All chunks received. Migration started." });
+  }
+
+  return c.json({ complete: false, received, total: totalChunks });
+});
+
+async function reassembleAndMigrate(uploadId: string, totalChunks: number) {
+  const uploadDir = path.join(UPLOAD_DIR, uploadId);
+  const outPath   = path.join(UPLOAD_DIR, `${uploadId}.bin`);
+  console.log(`Reassembling ${totalChunks} chunks for upload ${uploadId}…`);
+  const ws = createWriteStream(outPath);
+  for (let i = 0; i < totalChunks; i++) {
+    const data = await Bun.file(path.join(uploadDir, `chunk-${i}`)).arrayBuffer();
+    await new Promise<void>((resolve, reject) =>
+      ws.write(Buffer.from(data), (err) => (err ? reject(err) : resolve()))
+    );
+  }
+  await new Promise<void>((resolve, reject) =>
+    ws.end((err: Error | null) => (err ? reject(err) : resolve()))
+  );
+  console.log(`Reassembly complete: ${outPath}`);
+  await runSqlMigration(outPath);
+}
 
 async function runSqlMigration(filePath: string) {
   try {
