@@ -1091,21 +1091,32 @@ async function runSqlMigration(filePath: string, opts: { dropFirst?: boolean } =
     if (isZip) {
       await Bun.spawn(["unzip", "-q", filePath, "-d", extractDir]).exited;
     } else if (isGz) {
-      await Bun.spawn(["tar", "-xzf", filePath, "-C", extractDir]).exited;
+      // Try tar first; if it fails (plain .gz, not .tar.gz) fall back to gunzip
+      const tarProc = Bun.spawn(["tar", "-xzf", filePath, "-C", extractDir], { stderr: "pipe" });
+      const tarExit = await tarProc.exited;
+      if (tarExit !== 0) {
+        // Plain gzip — decompress directly to dump.sql
+        const gunzipProc = Bun.spawn(
+          ["sh", "-c", `gunzip -c "${filePath}" > "${path.join(extractDir, "dump.sql")}"`]
+        );
+        await gunzipProc.exited;
+      }
     } else {
       // assume raw sql
-      await Bun.spawn(["cp", filePath, path.join(extractDir, "dump.sql")])
-        .exited;
+      await Bun.spawn(["cp", filePath, path.join(extractDir, "dump.sql")]).exited;
     }
 
-    const files = await readdir(extractDir);
-    const sqlFiles = files.filter((f) => f.endsWith(".sql"));
+    // Find the .sql file recursively (it may be nested inside a subdirectory)
+    const findProc = Bun.spawn(["find", extractDir, "-name", "*.sql", "-type", "f"], { stdout: "pipe" });
+    await findProc.exited;
+    const foundText = await new Response(findProc.stdout).text();
+    const sqlFiles = foundText.trim().split("\n").filter(Boolean);
 
     if (sqlFiles.length !== 1) {
-      throw new Error("Archive must contain exactly ONE .sql file");
+      throw new Error(`Archive must contain exactly ONE .sql file (found ${sqlFiles.length})`);
     }
 
-    const sqlPath = path.join(extractDir, sqlFiles[0]);
+    const sqlPath = sqlFiles[0];
 
     const sqlFile = Bun.file(sqlPath);
     const totalBytes = sqlFile.size;
