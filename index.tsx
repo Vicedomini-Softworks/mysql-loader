@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { basicAuth } from "hono/basic-auth";
 import { createConnection } from "mysql2/promise";
-import { mkdir, readdir } from "fs/promises";
+import { mkdir, readdir, rm } from "fs/promises";
 import { existsSync, createWriteStream } from "fs";
 import path from "path";
 
@@ -90,6 +90,13 @@ const UI_HTML = /* html */ `<!DOCTYPE html>
     }
     #upload-btn:hover:not(:disabled) { background: #2ea043; }
     #upload-btn:disabled { background: #21262d; color: #484f58; cursor: not-allowed; }
+    #cleanup-btn {
+      margin-top: .6rem; padding: .4rem 0;
+      background: transparent; color: #6e7681; border: 1px solid #30363d; border-radius: 6px;
+      font-size: .85rem; cursor: pointer; transition: color .2s, border-color .2s;
+      width: 100%; max-width: 540px;
+    }
+    #cleanup-btn:hover { color: #f85149; border-color: #f85149; }
     #progress-wrap { margin-top: 1.5rem; width: 100%; max-width: 540px; display: none; }
     #progress-track { background: #21262d; border-radius: 4px; height: 8px; overflow: hidden; }
     #progress-fill  { height: 100%; background: #238636; width: 0%; transition: width .15s linear; border-radius: 4px; }
@@ -116,6 +123,7 @@ const UI_HTML = /* html */ `<!DOCTYPE html>
   </div>
 
   <button id="upload-btn" disabled>Upload</button>
+  <button id="cleanup-btn">Clear all uploads &amp; work files</button>
 
   <div id="progress-wrap">
     <div id="progress-track"><div id="progress-fill"></div></div>
@@ -209,6 +217,20 @@ const UI_HTML = /* html */ `<!DOCTYPE html>
     });
 
     uploadBtn.addEventListener('click', startUpload);
+
+    document.getElementById('cleanup-btn').addEventListener('click', async () => {
+      if (!confirm('Remove all chunks, partial uploads, and work files from the server?')) return;
+      try {
+        const res = await fetch('/api/cleanup', { method: 'DELETE', credentials: 'include' });
+        const data = await res.json();
+        statusEl.textContent = res.ok ? data.message : ('Cleanup failed: ' + (data.error || res.status));
+        statusEl.className = res.ok ? 'ok' : 'err';
+        if (res.ok) localStorage.clear();
+      } catch (err) {
+        statusEl.textContent = 'Cleanup failed: ' + err.message;
+        statusEl.className = 'err';
+      }
+    });
 
     async function startUpload() {
       if (!selectedFile) return;
@@ -370,6 +392,7 @@ const auth = basicAuth({
 app.use("/", auth);
 app.use("/api/upload", auth);
 app.use("/api/upload/*", auth);
+app.use("/api/cleanup", auth);
 
 app.get("/api/health", (c) => c.json({ status: "ok" }));
 
@@ -447,6 +470,20 @@ app.post("/api/upload/chunk", async (c) => {
   }
 
   return c.json({ complete: false, received, total: totalChunks });
+});
+
+app.delete("/api/cleanup", async (c) => {
+  let removed = 0;
+  for (const dir of [UPLOAD_DIR, WORK_DIR]) {
+    if (!existsSync(dir)) continue;
+    const entries = await readdir(dir);
+    for (const entry of entries) {
+      await rm(path.join(dir, entry), { recursive: true, force: true });
+      removed++;
+    }
+  }
+  console.log(`Cleanup: removed ${removed} entries from upload/work dirs.`);
+  return c.json({ message: `Cleanup complete. ${removed} entries removed.` });
 });
 
 async function reassembleAndMigrate(uploadId: string, totalChunks: number) {
