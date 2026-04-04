@@ -468,8 +468,9 @@ const UI_HTML = /* html */ `<!DOCTYPE html>
               progFill.style.width = '100%';
               sPct.textContent = '100%';
               sEta.textContent = 'done';
-              statusEl.textContent = 'Upload complete \u2014 migration is running on the server. Check server logs for progress.';
+              statusEl.textContent = 'Upload complete \u2014 redirecting to job page\u2026';
               statusEl.className = 'ok';
+              setTimeout(() => { window.location.href = '/job'; }, 800);
               return;
             }
             lastErr = null;
@@ -1070,6 +1071,19 @@ async function reassembleAndMigrate(uploadId: string, totalChunks: number) {
   await runSqlMigration(outPath, {});
 }
 
+async function spawnLogged(cmd: string[], label: string): Promise<number> {
+  const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe" });
+  const [exit, stdout, stderr] = await Promise.all([
+    proc.exited,
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  for (const line of (stdout + stderr).split("\n").filter(Boolean)) {
+    jobLog(`[${label}] ${line}`);
+  }
+  return exit;
+}
+
 async function runSqlMigration(filePath: string, opts: { dropFirst?: boolean } = {}) {
   jobFilePath = filePath;
   emitJob({ type: "status", state: "running", msg: `Migration started: ${path.basename(filePath)}` });
@@ -1089,17 +1103,17 @@ async function runSqlMigration(filePath: string, opts: { dropFirst?: boolean } =
     const isZip = magic[0] === 0x50 && magic[1] === 0x4b && magic[2] === 0x03 && magic[3] === 0x04;
 
     if (isZip) {
-      await Bun.spawn(["unzip", "-q", filePath, "-d", extractDir]).exited;
+      await spawnLogged(["unzip", filePath, "-d", extractDir], "unzip");
     } else if (isGz) {
       // Try tar first; if it fails (plain .gz, not .tar.gz) fall back to gunzip
-      const tarProc = Bun.spawn(["tar", "-xzf", filePath, "-C", extractDir], { stderr: "pipe" });
-      const tarExit = await tarProc.exited;
+      const tarExit = await spawnLogged(["tar", "-xzvf", filePath, "-C", extractDir], "tar");
       if (tarExit !== 0) {
         // Plain gzip — decompress directly to dump.sql
-        const gunzipProc = Bun.spawn(
-          ["sh", "-c", `gunzip -c "${filePath}" > "${path.join(extractDir, "dump.sql")}"`]
+        jobLog("[gunzip] Retrying as plain gzip…");
+        await spawnLogged(
+          ["sh", "-c", `gunzip -c "${filePath}" > "${path.join(extractDir, "dump.sql")}"`],
+          "gunzip"
         );
-        await gunzipProc.exited;
       }
     } else {
       // assume raw sql
