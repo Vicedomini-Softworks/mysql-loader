@@ -155,10 +155,32 @@ const UI_HTML = /* html */ `<!DOCTYPE html>
     .ok  { color: #3fb950; }
     .err { color: #f85149; }
     code { font-family: ui-monospace, monospace; font-size: .9em; }
+    nav { width: 100%; max-width: 540px; display: flex; justify-content: flex-end; margin-bottom: 1rem; }
+    nav a { font-size: .85rem; color: #58a6ff; text-decoration: none; }
+    nav a:hover { text-decoration: underline; }
+    #pending-section { width: 100%; max-width: 540px; margin-bottom: 1rem; display: none; }
+    #pending-section h2 { font-size: .78rem; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: #8b949e; margin-bottom: .4rem; }
+    .prow {
+      display: flex; align-items: center; gap: .5rem; padding: .35rem .6rem;
+      background: #161b22; border: 1px solid #30363d; border-radius: 6px; margin-bottom: .3rem;
+    }
+    .prow-info { flex: 1; font-size: .82rem; }
+    .prow-name { color: #e6edf3; font-family: ui-monospace, monospace; word-break: break-all; }
+    .prow-chunks { color: #8b949e; font-size: .75rem; margin-top: .1rem; }
+    .btn-resume-pick { padding: .22rem .65rem; border-radius: 4px; font-size: .78rem; cursor: pointer; border: 1px solid #d29922; background: transparent; color: #d29922; white-space: nowrap; }
+    .btn-resume-pick:hover { background: #2a1f00; }
+    .btn-discard { padding: .22rem .5rem; border-radius: 4px; font-size: .78rem; cursor: pointer; border: 1px solid #30363d; background: transparent; color: #6e7681; }
+    .btn-discard:hover { color: #f85149; border-color: #f85149; }
   </style>
 </head>
 <body>
   <h1>MySQL Loader</h1>
+  <nav><a href="/job">View job status \u2192</a></nav>
+
+  <div id="pending-section">
+    <h2>Pending uploads</h2>
+    <div id="pending-list"></div>
+  </div>
 
   <div id="drop-zone">
     <p>Drop a <code>.sql</code>, <code>.gz</code>, <code>.tgz</code>, or <code>.zip</code> backup here</p>
@@ -217,6 +239,67 @@ const UI_HTML = /* html */ `<!DOCTYPE html>
     }
     function storageKey(f) { return 'mysql-loader::' + f.name + '::' + f.size; }
 
+    // Show pending (interrupted) uploads from localStorage on page load
+    function renderPendingUploads() {
+      const section  = document.getElementById('pending-section');
+      const list     = document.getElementById('pending-list');
+      const entries  = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (!key || !key.startsWith('mysql-loader::')) continue;
+        try {
+          const val  = JSON.parse(localStorage.getItem(key));
+          const rest = key.slice('mysql-loader::'.length); // "filename::size"
+          const sep  = rest.lastIndexOf('::');
+          const filename = rest.slice(0, sep);
+          const size     = Number(rest.slice(sep + 2));
+          entries.push({ key, filename, size, uploadId: val.uploadId, totalChunks: val.totalChunks });
+        } catch {}
+      }
+      if (!entries.length) { section.style.display = 'none'; return; }
+      section.style.display = 'block';
+      list.innerHTML = '';
+      for (const entry of entries) {
+        const row = document.createElement('div');
+        row.className = 'prow';
+
+        const info = document.createElement('div');
+        info.className = 'prow-info';
+        const nm = document.createElement('div');
+        nm.className = 'prow-name';
+        nm.textContent = entry.filename;
+        const chunks = document.createElement('div');
+        chunks.className = 'prow-chunks';
+        chunks.textContent = fmt(entry.size) + ' \u00b7 upload ID: ' + entry.uploadId.slice(0, 8) + '\u2026 \u00b7 ' + entry.totalChunks + ' chunks total';
+        info.appendChild(nm);
+        info.appendChild(chunks);
+        row.appendChild(info);
+
+        const btnPick = document.createElement('button');
+        btnPick.className = 'btn-resume-pick';
+        btnPick.textContent = '\u21ba Select file to resume';
+        btnPick.addEventListener('click', () => {
+          // Pre-seed resumeState so pickFile() immediately detects it
+          resumeState = { uploadId: entry.uploadId, totalChunks: entry.totalChunks, confirmedChunks: new Set() };
+          fileInput.click();
+        });
+        row.appendChild(btnPick);
+
+        const btnDiscard = document.createElement('button');
+        btnDiscard.className = 'btn-discard';
+        btnDiscard.title = 'Discard saved progress';
+        btnDiscard.textContent = '\u2715';
+        btnDiscard.addEventListener('click', () => {
+          localStorage.removeItem(entry.key);
+          row.remove();
+          if (!list.children.length) section.style.display = 'none';
+        });
+        row.appendChild(btnDiscard);
+
+        list.appendChild(row);
+      }
+    }
+
     async function checkResume(file) {
       const raw = localStorage.getItem(storageKey(file));
       if (!raw) return null;
@@ -272,12 +355,15 @@ const UI_HTML = /* html */ `<!DOCTYPE html>
         const data = await res.json();
         statusEl.textContent = res.ok ? data.message : ('Cleanup failed: ' + (data.error || res.status));
         statusEl.className = res.ok ? 'ok' : 'err';
-        if (res.ok) localStorage.clear();
+        if (res.ok) { localStorage.clear(); renderPendingUploads(); }
       } catch (err) {
         statusEl.textContent = 'Cleanup failed: ' + err.message;
         statusEl.className = 'err';
       }
     });
+
+    // Show pending uploads on page load
+    renderPendingUploads();
 
     async function startUpload() {
       if (!selectedFile) return;
@@ -774,6 +860,7 @@ app.use("/api/upload", auth);
 app.use("/api/upload/*", auth);
 app.use("/api/cleanup", auth);
 app.use("/api/job/*", auth);
+app.use("/api/files", auth);
 app.use("/api/files/*", auth);
 
 app.get("/api/health", (c) => c.json({ status: "ok" }));
@@ -825,7 +912,7 @@ app.get("/api/files", async (c) => {
   if (!existsSync(UPLOAD_DIR)) return c.json({ files: [] });
   const entries = await readdir(UPLOAD_DIR, { withFileTypes: true });
   const files = entries
-    .filter((e) => e.isFile() && (e.name.endsWith(".bin") || e.name.startsWith("upload-")))
+    .filter((e) => e.isFile())
     .map((e) => {
       const p = path.join(UPLOAD_DIR, e.name);
       return { name: e.name, size: Bun.file(p).size };
