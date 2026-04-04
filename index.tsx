@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { basicAuth } from "hono/basic-auth";
+import { streamSSE } from "hono/streaming";
 import { createConnection } from "mysql2/promise";
 import { mkdir, readdir, rm } from "fs/promises";
 import { existsSync, createWriteStream } from "fs";
@@ -52,6 +53,39 @@ function renderProgressBar(
     `ETA ${formatDuration(eta)}`,
   ].join(" ");
 }
+
+// ── Job state & SSE broadcast ─────────────────────────────────────────────────
+
+type JobState = "idle" | "running" | "done" | "failed";
+
+interface JobEntry {
+  id:       number;
+  t:        number;
+  type:     "log" | "error" | "progress" | "status";
+  msg?:     string;
+  state?:   JobState;
+  progress?: { pct: number; done: number; total: number; speed: number; eta: number };
+}
+
+let   jobState: JobState = "idle";
+let   jobEntryId = 0;
+const JOB_RING_MAX = 400;
+const jobRing: JobEntry[] = [];
+const sseWaiters = new Set<() => void>();
+
+function emitJob(entry: Omit<JobEntry, "id" | "t">) {
+  const e: JobEntry = { id: ++jobEntryId, t: Date.now(), ...entry } as JobEntry;
+  if (e.type === "status" && e.state) jobState = e.state;
+  jobRing.push(e);
+  if (jobRing.length > JOB_RING_MAX) jobRing.shift();
+  for (const w of sseWaiters) w();
+  sseWaiters.clear();
+}
+
+function jobLog(msg: string)   { console.log(msg);   emitJob({ type: "log",   msg }); }
+function jobError(msg: string) { console.error(msg); emitJob({ type: "error", msg }); }
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 const UI_HTML = /* html */ `<!DOCTYPE html>
 <html lang="en">
@@ -361,6 +395,190 @@ const UI_HTML = /* html */ `<!DOCTYPE html>
 </body>
 </html>`;
 
+const JOB_HTML = /* html */ `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MySQL Loader \u2014 Job</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0d1117; color: #c9d1d9;
+      height: 100dvh; display: flex; flex-direction: column; overflow: hidden;
+    }
+    header {
+      display: flex; align-items: center; gap: .9rem; padding: .65rem 1.2rem;
+      border-bottom: 1px solid #21262d; flex-shrink: 0;
+    }
+    header a { color: #58a6ff; text-decoration: none; font-size: .88rem; white-space: nowrap; }
+    header a:hover { text-decoration: underline; }
+    h1 { font-size: .95rem; font-weight: 600; color: #e6edf3; flex: 1; }
+    #badge {
+      font-size: .7rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+      padding: .18rem .5rem; border-radius: 10px; background: #21262d; color: #8b949e;
+    }
+    #badge.running { background: #1f3a5f; color: #58a6ff; animation: pulse 1.4s ease-in-out infinite; }
+    #badge.done    { background: #1a3a2a; color: #3fb950; }
+    #badge.failed  { background: #3a1a1a; color: #f85149; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
+    #conn { font-size: .75rem; color: #484f58; white-space: nowrap; }
+    #conn.ok { color: #3fb950; }
+
+    #progress-wrap { flex-shrink: 0; padding: .6rem 1.2rem; border-bottom: 1px solid #21262d; display: none; }
+    #progress-track { background: #21262d; border-radius: 4px; height: 6px; overflow: hidden; }
+    #progress-fill  { height: 100%; background: #238636; width: 0%; transition: width .2s linear; border-radius: 4px; }
+    #progress-stats {
+      display: flex; gap: 1.2rem; margin-top: .35rem;
+      font-size: .78rem; color: #8b949e; font-variant-numeric: tabular-nums;
+    }
+
+    #log {
+      flex: 1; overflow-y: auto; padding: .65rem 1.2rem;
+      font-family: ui-monospace, 'Cascadia Code', 'Fira Code', monospace;
+      font-size: .8rem; line-height: 1.65;
+    }
+    .ln { white-space: pre-wrap; word-break: break-all; }
+    .ln-log    { color: #c9d1d9; }
+    .ln-error  { color: #f85149; }
+    .ln-s-running { color: #58a6ff; }
+    .ln-s-done    { color: #3fb950; }
+    .ln-s-failed  { color: #f85149; }
+    .ts { color: #484f58; user-select: none; }
+  </style>
+</head>
+<body>
+  <header>
+    <a href="/">\u2190 Upload</a>
+    <h1>Job Status</h1>
+    <span id="badge">idle</span>
+    <span id="conn">\u25cf disconnected</span>
+  </header>
+
+  <div id="progress-wrap">
+    <div id="progress-track"><div id="progress-fill"></div></div>
+    <div id="progress-stats">
+      <span id="s-pct">0%</span>
+      <span id="s-bytes">\u2014 / \u2014</span>
+      <span id="s-speed">\u2014 /s</span>
+      <span id="s-eta">ETA \u2014</span>
+    </div>
+  </div>
+
+  <div id="log"></div>
+
+  <script>
+    const badge    = document.getElementById('badge');
+    const connEl   = document.getElementById('conn');
+    const progWrap = document.getElementById('progress-wrap');
+    const progFill = document.getElementById('progress-fill');
+    const sPct     = document.getElementById('s-pct');
+    const sBytes   = document.getElementById('s-bytes');
+    const sSpeed   = document.getElementById('s-speed');
+    const sEta     = document.getElementById('s-eta');
+    const log      = document.getElementById('log');
+
+    function fmt(b) {
+      if (b >= 1e9) return (b / 1e9).toFixed(2) + ' GB';
+      if (b >= 1e6) return (b / 1e6).toFixed(2) + ' MB';
+      if (b >= 1e3) return (b / 1e3).toFixed(2) + ' KB';
+      return b + ' B';
+    }
+    function fmtDur(s) {
+      if (!isFinite(s) || s <= 0) return '\u2014';
+      if (s < 60) return Math.round(s) + 's';
+      return Math.floor(s / 60) + 'm ' + Math.round(s % 60) + 's';
+    }
+    function hhmm(ms) {
+      return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+    }
+
+    function setState(state) {
+      badge.textContent = state;
+      badge.className   = state;
+      if (state === 'done') {
+        progWrap.style.display = 'block';
+        progFill.style.width = '100%';
+        sPct.textContent = '100%';
+        sEta.textContent = 'done';
+      }
+    }
+
+    function atBottom() {
+      return log.scrollHeight - log.scrollTop - log.clientHeight < 60;
+    }
+    function scrollDown() { log.scrollTop = log.scrollHeight; }
+
+    function renderEntry(e) {
+      if (e.type === 'progress') {
+        const p = e.progress;
+        progWrap.style.display = 'block';
+        progFill.style.width = (p.pct * 100).toFixed(1) + '%';
+        sPct.textContent   = (p.pct * 100).toFixed(1) + '%';
+        sBytes.textContent = fmt(p.done) + ' / ' + fmt(p.total);
+        sSpeed.textContent = p.speed > 0 ? fmt(p.speed) + '/s' : '\u2014 /s';
+        sEta.textContent   = 'ETA ' + fmtDur(p.eta);
+        return;
+      }
+
+      const wasAtBottom = atBottom();
+      const div = document.createElement('div');
+
+      let cls = 'ln ';
+      if      (e.type === 'status') cls += 'ln-s-' + (e.state || 'running');
+      else if (e.type === 'error')  cls += 'ln-error';
+      else                          cls += 'ln-log';
+      div.className = cls;
+
+      const ts = document.createElement('span');
+      ts.className = 'ts';
+      ts.textContent = '[' + hhmm(e.t) + '] ';
+      div.appendChild(ts);
+      div.appendChild(document.createTextNode(e.msg || ''));
+      log.appendChild(div);
+      if (wasAtBottom) scrollDown();
+    }
+
+    let es = null;
+
+    function connect() {
+      connEl.textContent = '\u25cf connecting\u2026';
+      connEl.className = '';
+      es = new EventSource('/api/job/stream');
+
+      es.onopen = () => {
+        connEl.textContent = '\u25cf connected';
+        connEl.className = 'ok';
+      };
+
+      es.onmessage = (ev) => {
+        const data = JSON.parse(ev.data);
+        if (data.type === 'init') {
+          setState(data.state);
+          log.innerHTML = '';
+          for (const e of data.history) renderEntry(e);
+          scrollDown();
+        } else {
+          renderEntry(data);
+          if (data.type === 'status' && data.state) setState(data.state);
+        }
+      };
+
+      es.onerror = () => {
+        connEl.textContent = '\u25cf reconnecting\u2026';
+        connEl.className = '';
+        es.close();
+        es = null;
+        setTimeout(connect, 3000);
+      };
+    }
+
+    connect();
+  </script>
+</body>
+</html>`;
+
 const app = new Hono({ strict: false });
 
 const UPLOAD_DIR = process.env.UPLOAD_DIR || "./uploads";
@@ -390,13 +608,49 @@ const auth = basicAuth({
 });
 
 app.use("/", auth);
+app.use("/job", auth);
 app.use("/api/upload", auth);
 app.use("/api/upload/*", auth);
 app.use("/api/cleanup", auth);
+app.use("/api/job/*", auth);
 
 app.get("/api/health", (c) => c.json({ status: "ok" }));
 
 app.get("/", (c) => c.html(UI_HTML));
+
+app.get("/job", (c) => c.html(JOB_HTML));
+
+app.get("/api/job/stream", (c) =>
+  streamSSE(c, async (stream) => {
+    await stream.writeSSE({
+      data: JSON.stringify({ type: "init", state: jobState, history: [...jobRing] }),
+    });
+
+    let cursor  = jobEntryId;
+    let aborted = false;
+    stream.onAbort(() => { aborted = true; });
+
+    while (!aborted) {
+      const newEntries = jobRing.filter((e) => e.id > cursor);
+      if (newEntries.length > 0) {
+        cursor = newEntries[newEntries.length - 1].id;
+        for (const e of newEntries) {
+          if (aborted) break;
+          await stream.writeSSE({ data: JSON.stringify(e) });
+        }
+      }
+      if (!aborted) {
+        // Wait until a new event is emitted or 20 s heartbeat fires
+        await new Promise<void>((resolve) => {
+          let done = false;
+          const wake = () => { if (!done) { done = true; resolve(); } };
+          const timer = setTimeout(() => { sseWaiters.delete(wake); wake(); }, 20_000);
+          sseWaiters.add(() => { clearTimeout(timer); wake(); });
+        });
+      }
+    }
+  })
+);
 
 app.post("/api/upload", async (c) => {
   const filename = `upload-${Date.now()}`;
@@ -489,7 +743,7 @@ app.delete("/api/cleanup", async (c) => {
 async function reassembleAndMigrate(uploadId: string, totalChunks: number) {
   const uploadDir = path.join(UPLOAD_DIR, uploadId);
   const outPath   = path.join(UPLOAD_DIR, `${uploadId}.bin`);
-  console.log(`Reassembling ${totalChunks} chunks for upload ${uploadId}…`);
+  jobLog(`Reassembling ${totalChunks} chunks for upload ${uploadId}…`);
   const ws = createWriteStream(outPath);
   for (let i = 0; i < totalChunks; i++) {
     const data = await Bun.file(path.join(uploadDir, `chunk-${i}`)).arrayBuffer();
@@ -500,13 +754,14 @@ async function reassembleAndMigrate(uploadId: string, totalChunks: number) {
   await new Promise<void>((resolve, reject) =>
     ws.end((err: Error | null) => (err ? reject(err) : resolve()))
   );
-  console.log(`Reassembly complete: ${outPath}`);
+  jobLog(`Reassembly complete: ${outPath}`);
   await runSqlMigration(outPath);
 }
 
 async function runSqlMigration(filePath: string) {
+  emitJob({ type: "status", state: "running", msg: `Migration started: ${filePath}` });
   try {
-    console.log("Processing:", filePath);
+    jobLog(`Processing: ${filePath}`);
 
     const extractDir = path.join(WORK_DIR, `job-${Date.now()}`);
     await mkdir(extractDir, { recursive: true });
@@ -533,8 +788,7 @@ async function runSqlMigration(filePath: string) {
 
     const sqlFile = Bun.file(sqlPath);
     const totalBytes = sqlFile.size;
-    console.log("Running SQL:", sqlPath, `(${formatBytes(totalBytes)})`);
-    console.log("");
+    jobLog(`Running SQL: ${sqlPath} (${formatBytes(totalBytes)})`);
 
     const connection = await createConnection({
       host: process.env.MYSQL_HOST,
@@ -570,6 +824,18 @@ async function runSqlMigration(filePath: string) {
         if (now - lastLogTime >= PROGRESS_UPDATE_INTERVAL_MS || bytesRead === totalBytes) {
           lastLogTime = now;
           process.stdout.write("\r" + renderProgressBar(bytesRead, totalBytes, startTime));
+          const elapsedSec = (now - startTime) / 1000;
+          const speed = elapsedSec > 0 ? bytesRead / elapsedSec : 0;
+          emitJob({
+            type: "progress",
+            progress: {
+              pct:   totalBytes > 0 ? bytesRead / totalBytes : 1,
+              done:  bytesRead,
+              total: totalBytes,
+              speed,
+              eta:   speed > 0 ? (totalBytes - bytesRead) / speed : 0,
+            },
+          });
         }
 
         // Split on statement boundary (;\n or ;\r\n), execute complete statements
@@ -597,11 +863,13 @@ async function runSqlMigration(filePath: string) {
     process.stdout.write("\r" + renderProgressBar(totalBytes, totalBytes, startTime) + "\n");
 
     const elapsed = (Date.now() - startTime) / 1000;
-    console.log(
-      `SQL migration completed successfully in ${formatDuration(elapsed)} (${formatBytes(totalBytes / elapsed)}/s avg).`
-    );
+    const doneMsg = `SQL migration completed successfully in ${formatDuration(elapsed)} (${formatBytes(totalBytes / elapsed)}/s avg).`;
+    console.log(doneMsg);
+    emitJob({ type: "status", state: "done", msg: doneMsg });
   } catch (err) {
-    console.error("Migration failed:", err);
+    const errMsg = `Migration failed: ${err}`;
+    jobError(errMsg);
+    emitJob({ type: "status", state: "failed", msg: errMsg });
   }
 }
 
