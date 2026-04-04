@@ -409,6 +409,7 @@ const UI_HTML = /* html */ `<!DOCTYPE html>
           xhr.setRequestHeader('X-Upload-Id',    uploadId);
           xhr.setRequestHeader('X-Chunk-Index',  String(chunkIdx));
           xhr.setRequestHeader('X-Total-Chunks', String(totalChunks));
+          xhr.setRequestHeader('X-Filename',     file.name);
 
           xhr.upload.addEventListener('progress', (e) => {
             if (e.lengthComputable) onProgress(e.loaded);
@@ -944,8 +945,10 @@ app.post("/api/job/run", async (c) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 app.post("/api/upload", async (c) => {
-  const filename = `upload-${Date.now()}`;
-  const filePath = path.join(UPLOAD_DIR, filename);
+  const clientName = c.req.header("X-Filename") ?? "";
+  const ext        = (clientName && isSafeFilename(clientName)) ? path.extname(clientName) : "";
+  const filename   = `upload-${Date.now()}${ext}`;
+  const filePath   = path.join(UPLOAD_DIR, filename);
 
   const reader = c.req.raw.body?.getReader();
   if (!reader) return c.json({ error: "No body stream" }, 400);
@@ -982,6 +985,7 @@ app.post("/api/upload/chunk", async (c) => {
   const uploadId    = c.req.header("X-Upload-Id") ?? "";
   const chunkIndex  = parseInt(c.req.header("X-Chunk-Index") ?? "", 10);
   const totalChunks = parseInt(c.req.header("X-Total-Chunks") ?? "", 10);
+  const clientName  = c.req.header("X-Filename") ?? "";
 
   if (
     !/^[\w-]+$/.test(uploadId) ||
@@ -993,6 +997,14 @@ app.post("/api/upload/chunk", async (c) => {
 
   const uploadDir = path.join(UPLOAD_DIR, uploadId);
   if (!existsSync(uploadDir)) await mkdir(uploadDir, { recursive: true });
+
+  // Persist original filename so reassembly can use the correct extension
+  if (clientName && isSafeFilename(clientName)) {
+    const metaPath = path.join(uploadDir, "meta.json");
+    if (!existsSync(metaPath)) {
+      await Bun.write(metaPath, JSON.stringify({ filename: clientName }));
+    }
+  }
 
   const chunkPath = path.join(uploadDir, `chunk-${chunkIndex}`);
   const reader = c.req.raw.body?.getReader();
@@ -1033,7 +1045,16 @@ app.delete("/api/cleanup", async (c) => {
 
 async function reassembleAndMigrate(uploadId: string, totalChunks: number) {
   const uploadDir = path.join(UPLOAD_DIR, uploadId);
-  const outPath   = path.join(UPLOAD_DIR, `${uploadId}.bin`);
+
+  // Recover original filename (and its extension) saved during chunk upload
+  let originalName = "";
+  try {
+    const meta = await Bun.file(path.join(uploadDir, "meta.json")).json() as { filename: string };
+    if (isSafeFilename(meta.filename)) originalName = meta.filename;
+  } catch {}
+  const ext     = originalName ? path.extname(originalName) : ".bin";
+  const outPath = path.join(UPLOAD_DIR, `${uploadId}${ext}`);
+
   jobLog(`Reassembling ${totalChunks} chunks for upload ${uploadId}…`);
   const ws = createWriteStream(outPath);
   for (let i = 0; i < totalChunks; i++) {
@@ -1058,10 +1079,18 @@ async function runSqlMigration(filePath: string, opts: { dropFirst?: boolean } =
     const extractDir = path.join(WORK_DIR, `job-${Date.now()}`);
     await mkdir(extractDir, { recursive: true });
 
-    // Detect compression
-    if (filePath.endsWith(".zip")) {
+    // Detect compression by magic bytes (not file extension, since uploaded
+    // files are stored without their original extension)
+    const magic = Buffer.alloc(4);
+    const fd = await import("fs").then(m => m.promises.open(filePath, "r"));
+    await fd.read(magic, 0, 4, 0);
+    await fd.close();
+    const isGz  = magic[0] === 0x1f && magic[1] === 0x8b;
+    const isZip = magic[0] === 0x50 && magic[1] === 0x4b && magic[2] === 0x03 && magic[3] === 0x04;
+
+    if (isZip) {
       await Bun.spawn(["unzip", "-q", filePath, "-d", extractDir]).exited;
-    } else if (filePath.endsWith(".gz") || filePath.endsWith(".tgz")) {
+    } else if (isGz) {
       await Bun.spawn(["tar", "-xzf", filePath, "-C", extractDir]).exited;
     } else {
       // assume raw sql

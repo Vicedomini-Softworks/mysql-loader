@@ -18,6 +18,7 @@ echo ""
 pv -p -t -e -r -a -b -s "$FILESIZE" "$FILE" | \
 curl -u "$USER:$PASS" \
      -X POST \
+     -H "X-Filename: $(basename "$FILE")" \
      --upload-file - \
      "$URL"
 
