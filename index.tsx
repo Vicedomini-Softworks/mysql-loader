@@ -53,6 +53,190 @@ function renderProgressBar(
   ].join(" ");
 }
 
+const UI_HTML = /* html */ `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MySQL Loader</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0d1117; color: #c9d1d9;
+      min-height: 100vh; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; padding: 2rem;
+    }
+    h1 { font-size: 1.4rem; font-weight: 600; margin-bottom: 2rem; color: #58a6ff; letter-spacing: .02em; }
+    #drop-zone {
+      border: 2px dashed #30363d; border-radius: 10px;
+      padding: 3rem 2rem; text-align: center; cursor: pointer;
+      transition: border-color .2s, background .2s;
+      width: 100%; max-width: 540px;
+    }
+    #drop-zone.drag-over { border-color: #58a6ff; background: #161b22; }
+    #drop-zone.has-file  { border-color: #3fb950; }
+    #drop-zone p { color: #8b949e; line-height: 1.7; }
+    #drop-zone label { color: #58a6ff; cursor: pointer; text-decoration: underline; }
+    #file-input { display: none; }
+    #file-name { margin-top: .75rem; font-weight: 600; color: #e6edf3; word-break: break-all; }
+    #file-size { margin-top: .2rem; font-size: .85rem; color: #8b949e; }
+    #upload-btn {
+      margin-top: 1.5rem; padding: .65rem 0;
+      background: #238636; color: #fff; border: none; border-radius: 6px;
+      font-size: 1rem; cursor: pointer; transition: background .2s;
+      width: 100%; max-width: 540px;
+    }
+    #upload-btn:hover:not(:disabled) { background: #2ea043; }
+    #upload-btn:disabled { background: #21262d; color: #484f58; cursor: not-allowed; }
+    #progress-wrap { margin-top: 1.5rem; width: 100%; max-width: 540px; display: none; }
+    #progress-track { background: #21262d; border-radius: 4px; height: 8px; overflow: hidden; }
+    #progress-fill  { height: 100%; background: #238636; width: 0%; transition: width .15s linear; border-radius: 4px; }
+    #progress-stats {
+      display: flex; justify-content: space-between; flex-wrap: wrap; gap: .25rem;
+      margin-top: .5rem; font-size: .8rem; color: #8b949e; font-variant-numeric: tabular-nums;
+    }
+    #status { margin-top: 1.5rem; font-size: .9rem; max-width: 540px; text-align: center; min-height: 1.4em; }
+    .ok  { color: #3fb950; }
+    .err { color: #f85149; }
+    code { font-family: ui-monospace, monospace; font-size: .9em; }
+  </style>
+</head>
+<body>
+  <h1>MySQL Loader</h1>
+
+  <div id="drop-zone">
+    <p>Drop a <code>.sql</code>, <code>.gz</code>, <code>.tgz</code>, or <code>.zip</code> backup here</p>
+    <p>or <label for="file-input">browse to select a file</label></p>
+    <input type="file" id="file-input" accept=".gz,.tgz,.zip,.sql">
+    <div id="file-name"></div>
+    <div id="file-size"></div>
+  </div>
+
+  <button id="upload-btn" disabled>Upload</button>
+
+  <div id="progress-wrap">
+    <div id="progress-track"><div id="progress-fill"></div></div>
+    <div id="progress-stats">
+      <span id="s-pct">0%</span>
+      <span id="s-bytes">— / —</span>
+      <span id="s-speed">— /s</span>
+      <span id="s-eta">ETA —</span>
+    </div>
+  </div>
+
+  <div id="status"></div>
+
+  <script>
+    const dropZone   = document.getElementById('drop-zone');
+    const fileInput  = document.getElementById('file-input');
+    const uploadBtn  = document.getElementById('upload-btn');
+    const progWrap   = document.getElementById('progress-wrap');
+    const progFill   = document.getElementById('progress-fill');
+    const sPct       = document.getElementById('s-pct');
+    const sBytes     = document.getElementById('s-bytes');
+    const sSpeed     = document.getElementById('s-speed');
+    const sEta       = document.getElementById('s-eta');
+    const statusEl   = document.getElementById('status');
+    const fileNameEl = document.getElementById('file-name');
+    const fileSizeEl = document.getElementById('file-size');
+
+    let selectedFile = null;
+
+    function fmt(b) {
+      if (b >= 1e9) return (b / 1e9).toFixed(2) + ' GB';
+      if (b >= 1e6) return (b / 1e6).toFixed(2) + ' MB';
+      if (b >= 1e3) return (b / 1e3).toFixed(2) + ' KB';
+      return b + ' B';
+    }
+    function fmtDur(s) {
+      if (!isFinite(s) || s <= 0) return '—';
+      if (s < 60) return Math.round(s) + 's';
+      return Math.floor(s / 60) + 'm ' + Math.round(s % 60) + 's';
+    }
+
+    function pickFile(file) {
+      selectedFile = file;
+      fileNameEl.textContent = file.name;
+      fileSizeEl.textContent = fmt(file.size);
+      dropZone.classList.add('has-file');
+      dropZone.classList.remove('drag-over');
+      uploadBtn.disabled = false;
+      statusEl.textContent = '';
+      statusEl.className = '';
+    }
+
+    dropZone.addEventListener('click', (e) => {
+      if (!e.target.closest('label')) fileInput.click();
+    });
+    fileInput.addEventListener('change', () => { if (fileInput.files[0]) pickFile(fileInput.files[0]); });
+    dropZone.addEventListener('dragover',  (e) => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+    dropZone.addEventListener('dragleave', ()  => dropZone.classList.remove('drag-over'));
+    dropZone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      const file = e.dataTransfer.files[0];
+      if (file) pickFile(file);
+    });
+
+    uploadBtn.addEventListener('click', () => {
+      if (!selectedFile) return;
+      uploadBtn.disabled = true;
+      progWrap.style.display = 'block';
+      statusEl.textContent = 'Uploading\u2026';
+      statusEl.className = '';
+
+      const startTime = Date.now();
+
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/upload');
+      xhr.withCredentials = true;
+
+      xhr.upload.addEventListener('progress', (e) => {
+        if (!e.lengthComputable) return;
+        const pct     = e.loaded / e.total;
+        const elapsed = (Date.now() - startTime) / 1000;
+        const speed   = elapsed > 0 ? e.loaded / elapsed : 0;
+        const eta     = speed > 0 ? (e.total - e.loaded) / speed : Infinity;
+        progFill.style.width = (pct * 100).toFixed(1) + '%';
+        sPct.textContent   = (pct * 100).toFixed(1) + '%';
+        sBytes.textContent = fmt(e.loaded) + ' / ' + fmt(e.total);
+        sSpeed.textContent = fmt(speed) + '/s';
+        sEta.textContent   = 'ETA ' + fmtDur(eta);
+      });
+
+      xhr.addEventListener('load', () => {
+        progFill.style.width = '100%';
+        sPct.textContent = '100%';
+        sEta.textContent = 'done';
+        if (xhr.status === 200) {
+          statusEl.textContent = 'Upload complete \u2014 migration is running on the server. Check server logs for progress.';
+          statusEl.className = 'ok';
+        } else if (xhr.status === 401) {
+          statusEl.textContent = 'Authentication failed. Reload the page to re-enter credentials.';
+          statusEl.className = 'err';
+          uploadBtn.disabled = false;
+        } else {
+          let msg = 'Upload failed (HTTP ' + xhr.status + ').';
+          try { msg = JSON.parse(xhr.responseText).error || msg; } catch {}
+          statusEl.textContent = msg;
+          statusEl.className = 'err';
+          uploadBtn.disabled = false;
+        }
+      });
+
+      xhr.addEventListener('error', () => {
+        statusEl.textContent = 'Network error during upload.';
+        statusEl.className = 'err';
+        uploadBtn.disabled = false;
+      });
+
+      // Send the File object directly — browser streams it from disk, no full RAM load
+      xhr.send(selectedFile);
+    });
+  </script>
+</body>
+</html>`;
+
 const app = new Hono({ strict: false });
 
 const UPLOAD_DIR = process.env.UPLOAD_DIR || "./uploads";
@@ -75,15 +259,18 @@ for (const dir of [UPLOAD_DIR, WORK_DIR]) {
 
 app.use("/*", cors());
 
-app.use(
-  "/api/upload",
-  basicAuth({
-    username: process.env.BASIC_AUTH_USER!,
-    password: process.env.BASIC_AUTH_PASS!,
-  })
-);
+const auth = basicAuth({
+  username: process.env.BASIC_AUTH_USER!,
+  password: process.env.BASIC_AUTH_PASS!,
+  realm: "MySQL Loader",
+});
+
+app.use("/", auth);
+app.use("/api/upload", auth);
 
 app.get("/api/health", (c) => c.json({ status: "ok" }));
+
+app.get("/", (c) => c.html(UI_HTML));
 
 app.post("/api/upload", async (c) => {
   const filename = `upload-${Date.now()}`;
