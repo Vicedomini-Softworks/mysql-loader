@@ -130,7 +130,7 @@ const UI_HTML = /* html */ `<!DOCTYPE html>
   <div id="status"></div>
 
   <script>
-    const CHUNK_SIZE = 10 * 1024 * 1024; // 10 MB
+    const CHUNK_SIZE = 256 * 1024 * 1024; // 256 MB
 
     const dropZone    = document.getElementById('drop-zone');
     const fileInput   = document.getElementById('file-input');
