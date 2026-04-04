@@ -68,14 +68,27 @@ interface JobEntry {
 }
 
 let   jobState: JobState = "idle";
+let   jobFilePath: string | null = null;
 let   jobEntryId = 0;
 const JOB_RING_MAX = 400;
 const jobRing: JobEntry[] = [];
 const sseWaiters = new Set<() => void>();
 
+// Persisted on every state change so an interrupted job can be detected on restart.
+// Defined lazily because WORK_DIR is set later; we write via a closure.
+function persistJobState() {
+  try {
+    const data = JSON.stringify({ state: jobState, filePath: jobFilePath, t: Date.now() });
+    Bun.write(`${process.env.WORK_DIR || "./work"}/job-state.json`, data).catch(() => {});
+  } catch {}
+}
+
 function emitJob(entry: Omit<JobEntry, "id" | "t">) {
   const e: JobEntry = { id: ++jobEntryId, t: Date.now(), ...entry } as JobEntry;
-  if (e.type === "status" && e.state) jobState = e.state;
+  if (e.type === "status" && e.state) {
+    jobState = e.state;
+    persistJobState();
+  }
   jobRing.push(e);
   if (jobRing.length > JOB_RING_MAX) jobRing.shift();
   for (const w of sseWaiters) w();
@@ -429,10 +442,38 @@ const JOB_HTML = /* html */ `<!DOCTYPE html>
     #progress-wrap { flex-shrink: 0; padding: .6rem 1.2rem; border-bottom: 1px solid #21262d; display: none; }
     #progress-track { background: #21262d; border-radius: 4px; height: 6px; overflow: hidden; }
     #progress-fill  { height: 100%; background: #238636; width: 0%; transition: width .2s linear; border-radius: 4px; }
-    #progress-stats {
-      display: flex; gap: 1.2rem; margin-top: .35rem;
-      font-size: .78rem; color: #8b949e; font-variant-numeric: tabular-nums;
+    #progress-stats { display: flex; gap: 1.2rem; margin-top: .35rem; font-size: .78rem; color: #8b949e; font-variant-numeric: tabular-nums; }
+
+    /* Files panel */
+    #files-panel { flex-shrink: 0; border-bottom: 1px solid #21262d; max-height: 200px; overflow-y: auto; }
+    #files-hdr {
+      display: flex; align-items: center; gap: .6rem; padding: .45rem 1.2rem;
+      font-size: .78rem; color: #8b949e; cursor: pointer; user-select: none;
+      position: sticky; top: 0; background: #0d1117; border-bottom: 1px solid #161b22;
     }
+    #files-hdr:hover { color: #c9d1d9; }
+    #files-hdr span:first-child { flex: 1; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; }
+    #files-hdr button { background: none; border: none; color: inherit; cursor: pointer; font-size: .9rem; padding: 0 .2rem; }
+    #files-body { padding: .3rem 1.2rem .5rem; }
+    .frow {
+      display: flex; align-items: center; gap: .5rem; padding: .25rem 0;
+      border-bottom: 1px solid #161b22; font-size: .8rem;
+    }
+    .frow:last-child { border: none; }
+    .frow.interrupted { background: #1f1a0d; margin: 0 -1.2rem; padding-left: 1.2rem; padding-right: 1.2rem; }
+    .fname { flex: 1; font-family: ui-monospace, monospace; color: #e6edf3; word-break: break-all; }
+    .fsize { color: #8b949e; white-space: nowrap; }
+    .fbadge { font-size: .65rem; background: #4a3000; color: #d29922; padding: .1rem .35rem; border-radius: 6px; white-space: nowrap; }
+    .btn-sm {
+      padding: .2rem .55rem; border-radius: 4px; font-size: .75rem; cursor: pointer;
+      border: 1px solid #30363d; background: #161b22; color: #c9d1d9; white-space: nowrap;
+    }
+    .btn-sm:hover { background: #21262d; }
+    .btn-drop { border-color: #d29922; color: #d29922; }
+    .btn-drop:hover { background: #2a1f00; }
+    .btn-del  { border-color: #f85149; color: #f85149; }
+    .btn-del:hover { background: #3a1a1a; }
+    #files-empty { padding: .4rem 0; font-size: .8rem; color: #484f58; }
 
     #log {
       flex: 1; overflow-y: auto; padding: .65rem 1.2rem;
@@ -440,8 +481,8 @@ const JOB_HTML = /* html */ `<!DOCTYPE html>
       font-size: .8rem; line-height: 1.65;
     }
     .ln { white-space: pre-wrap; word-break: break-all; }
-    .ln-log    { color: #c9d1d9; }
-    .ln-error  { color: #f85149; }
+    .ln-log      { color: #c9d1d9; }
+    .ln-error    { color: #f85149; }
     .ln-s-running { color: #58a6ff; }
     .ln-s-done    { color: #3fb950; }
     .ln-s-failed  { color: #f85149; }
@@ -466,18 +507,30 @@ const JOB_HTML = /* html */ `<!DOCTYPE html>
     </div>
   </div>
 
+  <div id="files-panel">
+    <div id="files-hdr">
+      <span>Available files</span>
+      <button id="files-refresh" title="Refresh">\u21bb</button>
+    </div>
+    <div id="files-body"><div id="files-empty">Loading\u2026</div></div>
+  </div>
+
   <div id="log"></div>
 
   <script>
-    const badge    = document.getElementById('badge');
-    const connEl   = document.getElementById('conn');
-    const progWrap = document.getElementById('progress-wrap');
-    const progFill = document.getElementById('progress-fill');
-    const sPct     = document.getElementById('s-pct');
-    const sBytes   = document.getElementById('s-bytes');
-    const sSpeed   = document.getElementById('s-speed');
-    const sEta     = document.getElementById('s-eta');
-    const log      = document.getElementById('log');
+    const badge      = document.getElementById('badge');
+    const connEl     = document.getElementById('conn');
+    const progWrap   = document.getElementById('progress-wrap');
+    const progFill   = document.getElementById('progress-fill');
+    const sPct       = document.getElementById('s-pct');
+    const sBytes     = document.getElementById('s-bytes');
+    const sSpeed     = document.getElementById('s-speed');
+    const sEta       = document.getElementById('s-eta');
+    const log        = document.getElementById('log');
+    const filesBody  = document.getElementById('files-body');
+    const filesEmpty = document.getElementById('files-empty');
+
+    let lastFile = null; // filename of last/interrupted migration
 
     function fmt(b) {
       if (b >= 1e9) return (b / 1e9).toFixed(2) + ' GB';
@@ -505,9 +558,7 @@ const JOB_HTML = /* html */ `<!DOCTYPE html>
       }
     }
 
-    function atBottom() {
-      return log.scrollHeight - log.scrollTop - log.clientHeight < 60;
-    }
+    function atBottom() { return log.scrollHeight - log.scrollTop - log.clientHeight < 60; }
     function scrollDown() { log.scrollTop = log.scrollHeight; }
 
     function renderEntry(e) {
@@ -521,16 +572,13 @@ const JOB_HTML = /* html */ `<!DOCTYPE html>
         sEta.textContent   = 'ETA ' + fmtDur(p.eta);
         return;
       }
-
       const wasAtBottom = atBottom();
       const div = document.createElement('div');
-
       let cls = 'ln ';
       if      (e.type === 'status') cls += 'ln-s-' + (e.state || 'running');
       else if (e.type === 'error')  cls += 'ln-error';
       else                          cls += 'ln-log';
       div.className = cls;
-
       const ts = document.createElement('span');
       ts.className = 'ts';
       ts.textContent = '[' + hhmm(e.t) + '] ';
@@ -539,6 +587,100 @@ const JOB_HTML = /* html */ `<!DOCTYPE html>
       log.appendChild(div);
       if (wasAtBottom) scrollDown();
     }
+
+    // ── File list ──────────────────────────────────────────────────────────────
+
+    async function loadFiles() {
+      filesEmpty.textContent = 'Loading\u2026';
+      // Remove old rows
+      Array.from(filesBody.querySelectorAll('.frow')).forEach(r => r.remove());
+      let files = [];
+      try {
+        const r = await fetch('/api/files', { credentials: 'include' });
+        if (r.ok) ({ files } = await r.json());
+      } catch {}
+      filesEmpty.style.display = files.length ? 'none' : '';
+      if (!files.length) { filesEmpty.textContent = 'No files available.'; return; }
+      filesEmpty.textContent = '';
+      for (const f of files) {
+        const row = document.createElement('div');
+        row.className = 'frow' + (f.name === lastFile ? ' interrupted' : '');
+
+        const nm = document.createElement('span');
+        nm.className = 'fname';
+        nm.textContent = f.name;
+        row.appendChild(nm);
+
+        if (f.name === lastFile) {
+          const badge = document.createElement('span');
+          badge.className = 'fbadge';
+          badge.textContent = 'interrupted';
+          row.appendChild(badge);
+        }
+
+        const sz = document.createElement('span');
+        sz.className = 'fsize';
+        sz.textContent = fmt(f.size);
+        row.appendChild(sz);
+
+        const btnDrop = document.createElement('button');
+        btnDrop.className = 'btn-sm btn-drop';
+        btnDrop.textContent = 'Drop \u0026 Load';
+        btnDrop.title = 'Drop the configured database and reload from this file';
+        btnDrop.addEventListener('click', () => runFile(f.name, true));
+        row.appendChild(btnDrop);
+
+        const btnLoad = document.createElement('button');
+        btnLoad.className = 'btn-sm';
+        btnLoad.textContent = 'Load';
+        btnLoad.title = 'Run migration without dropping the database first';
+        btnLoad.addEventListener('click', () => runFile(f.name, false));
+        row.appendChild(btnLoad);
+
+        const btnDel = document.createElement('button');
+        btnDel.className = 'btn-sm btn-del';
+        btnDel.textContent = '\u2715';
+        btnDel.title = 'Delete this file from the server';
+        btnDel.addEventListener('click', () => deleteFile(f.name, row));
+        row.appendChild(btnDel);
+
+        filesBody.appendChild(row);
+      }
+    }
+
+    async function runFile(filename, dropFirst) {
+      const action = dropFirst
+        ? 'Drop the database and reload from "' + filename + '"?'
+        : 'Run migration from "' + filename + '" (no drop)?';
+      if (!confirm(action)) return;
+      const r = await fetch('/api/job/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ filename, dropFirst }),
+      });
+      const data = await r.json();
+      if (!r.ok) alert('Error: ' + (data.error || r.status));
+    }
+
+    async function deleteFile(filename, row) {
+      if (!confirm('Delete "' + filename + '" from the server?')) return;
+      const r = await fetch('/api/files/' + encodeURIComponent(filename), {
+        method: 'DELETE', credentials: 'include',
+      });
+      if (r.ok) row.remove();
+      else {
+        const d = await r.json().catch(() => ({}));
+        alert('Error: ' + (d.error || r.status));
+      }
+    }
+
+    document.getElementById('files-refresh').addEventListener('click', (e) => {
+      e.stopPropagation();
+      loadFiles();
+    });
+
+    // ── SSE ───────────────────────────────────────────────────────────────────
 
     let es = null;
 
@@ -555,13 +697,18 @@ const JOB_HTML = /* html */ `<!DOCTYPE html>
       es.onmessage = (ev) => {
         const data = JSON.parse(ev.data);
         if (data.type === 'init') {
+          lastFile = data.lastFile || null;
           setState(data.state);
           log.innerHTML = '';
           for (const e of data.history) renderEntry(e);
           scrollDown();
+          loadFiles();
         } else {
           renderEntry(data);
-          if (data.type === 'status' && data.state) setState(data.state);
+          if (data.type === 'status' && data.state) {
+            setState(data.state);
+            if (data.state === 'done' || data.state === 'failed') loadFiles();
+          }
         }
       };
 
@@ -599,6 +746,20 @@ for (const dir of [UPLOAD_DIR, WORK_DIR]) {
   }
 }
 
+// Detect interrupted job from previous run
+try {
+  const stateFile = Bun.file(`${WORK_DIR}/job-state.json`);
+  if (await stateFile.exists()) {
+    const saved = await stateFile.json() as { state: JobState; filePath: string | null };
+    if (saved.state === "running" && saved.filePath) {
+      jobFilePath = saved.filePath;
+      const basename = saved.filePath.split(/[\\/]/).pop() ?? saved.filePath;
+      jobLog(`⚠ Server restarted. Previous migration was interrupted: ${basename}`);
+      emitJob({ type: "status", state: "failed", msg: "Migration interrupted by server restart." });
+    }
+  }
+} catch {}
+
 app.use("/*", cors());
 
 const auth = basicAuth({
@@ -613,6 +774,7 @@ app.use("/api/upload", auth);
 app.use("/api/upload/*", auth);
 app.use("/api/cleanup", auth);
 app.use("/api/job/*", auth);
+app.use("/api/files/*", auth);
 
 app.get("/api/health", (c) => c.json({ status: "ok" }));
 
@@ -622,8 +784,9 @@ app.get("/job", (c) => c.html(JOB_HTML));
 
 app.get("/api/job/stream", (c) =>
   streamSSE(c, async (stream) => {
+    const lastFile = jobFilePath ? jobFilePath.split(/[\\/]/).pop() ?? null : null;
     await stream.writeSSE({
-      data: JSON.stringify({ type: "init", state: jobState, history: [...jobRing] }),
+      data: JSON.stringify({ type: "init", state: jobState, history: [...jobRing], lastFile }),
     });
 
     let cursor  = jobEntryId;
@@ -651,6 +814,47 @@ app.get("/api/job/stream", (c) =>
     }
   })
 );
+
+// ── File management & manual job trigger ─────────────────────────────────────
+
+function isSafeFilename(name: string) {
+  return /^[\w.\-]+$/.test(name) && !name.includes("..");
+}
+
+app.get("/api/files", async (c) => {
+  if (!existsSync(UPLOAD_DIR)) return c.json({ files: [] });
+  const entries = await readdir(UPLOAD_DIR, { withFileTypes: true });
+  const files = entries
+    .filter((e) => e.isFile() && (e.name.endsWith(".bin") || e.name.startsWith("upload-")))
+    .map((e) => {
+      const p = path.join(UPLOAD_DIR, e.name);
+      return { name: e.name, size: Bun.file(p).size };
+    })
+    .sort((a, b) => b.name.localeCompare(a.name));
+  return c.json({ files });
+});
+
+app.delete("/api/files/:name", async (c) => {
+  const name = c.req.param("name");
+  if (!isSafeFilename(name)) return c.json({ error: "Invalid filename" }, 400);
+  const filePath = path.join(UPLOAD_DIR, name);
+  if (!existsSync(filePath)) return c.json({ error: "File not found" }, 404);
+  await rm(filePath, { force: true });
+  return c.json({ message: "Deleted." });
+});
+
+app.post("/api/job/run", async (c) => {
+  if (jobState === "running") return c.json({ error: "A migration is already running." }, 409);
+  const body = await c.req.json<{ filename: string; dropFirst?: boolean }>();
+  const { filename, dropFirst = false } = body;
+  if (!filename || !isSafeFilename(filename)) return c.json({ error: "Invalid filename" }, 400);
+  const filePath = path.join(UPLOAD_DIR, filename);
+  if (!existsSync(filePath)) return c.json({ error: "File not found" }, 404);
+  runSqlMigration(filePath, { dropFirst });
+  return c.json({ message: "Migration started." });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 app.post("/api/upload", async (c) => {
   const filename = `upload-${Date.now()}`;
@@ -755,11 +959,12 @@ async function reassembleAndMigrate(uploadId: string, totalChunks: number) {
     ws.end((err: Error | null) => (err ? reject(err) : resolve()))
   );
   jobLog(`Reassembly complete: ${outPath}`);
-  await runSqlMigration(outPath);
+  await runSqlMigration(outPath, {});
 }
 
-async function runSqlMigration(filePath: string) {
-  emitJob({ type: "status", state: "running", msg: `Migration started: ${filePath}` });
+async function runSqlMigration(filePath: string, opts: { dropFirst?: boolean } = {}) {
+  jobFilePath = filePath;
+  emitJob({ type: "status", state: "running", msg: `Migration started: ${path.basename(filePath)}` });
   try {
     jobLog(`Processing: ${filePath}`);
 
@@ -790,17 +995,36 @@ async function runSqlMigration(filePath: string) {
     const totalBytes = sqlFile.size;
     jobLog(`Running SQL: ${sqlPath} (${formatBytes(totalBytes)})`);
 
+    const sslOpts =
+      process.env.MYSQL_SSL_SELF_SIGNED === "1" || process.env.MYSQL_SSL_SELF_SIGNED === "true"
+        ? { ssl: { rejectUnauthorized: false } }
+        : {};
+
+    if (opts.dropFirst) {
+      const db = process.env.MYSQL_DATABASE!;
+      jobLog(`Dropping database "${db}"…`);
+      const adminConn = await createConnection({
+        host:     process.env.MYSQL_HOST,
+        port:     Number(process.env.MYSQL_PORT || "3306"),
+        user:     process.env.MYSQL_USER,
+        password: process.env.MYSQL_PASSWORD,
+        multipleStatements: true,
+        ...sslOpts,
+      });
+      await adminConn.query(`DROP DATABASE IF EXISTS \`${db}\``);
+      await adminConn.query(`CREATE DATABASE \`${db}\``);
+      await adminConn.end();
+      jobLog(`Database "${db}" dropped and recreated.`);
+    }
+
     const connection = await createConnection({
-      host: process.env.MYSQL_HOST,
-      port: Number(process.env.MYSQL_PORT || "3306"),
-      user: process.env.MYSQL_USER,
+      host:     process.env.MYSQL_HOST,
+      port:     Number(process.env.MYSQL_PORT || "3306"),
+      user:     process.env.MYSQL_USER,
       password: process.env.MYSQL_PASSWORD,
       database: process.env.MYSQL_DATABASE,
       multipleStatements: true,
-      ...(process.env.MYSQL_SSL_SELF_SIGNED === "1" ||
-      process.env.MYSQL_SSL_SELF_SIGNED === "true"
-        ? { ssl: { rejectUnauthorized: false } }
-        : {}),
+      ...sslOpts,
     });
 
     const startTime = Date.now();
